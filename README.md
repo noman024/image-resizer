@@ -1,6 +1,6 @@
 # Image Resizer for OCR
 
-Batch-resize images so every output file falls within a **5–10 megapixel (MP)** range, preserves aspect ratio, and is saved as **PNG** for OCR pipelines.
+Batch-resize images using the **`smart_resize`** algorithm, preserving aspect ratio and saving output as **PNG** for OCR pipelines.
 
 ## Requirements
 
@@ -36,9 +36,6 @@ Resized PNG files are written to `output/` by default.
 # Custom input/output directories
 python resize_images.py -i ./photos -o ./resized
 
-# Custom megapixel bounds
-python resize_images.py --min-mp 5 --max-mp 10
-
 # Verbose logging (includes Pillow debug output)
 python resize_images.py -v
 ```
@@ -49,35 +46,38 @@ python resize_images.py -v
 |--------|---------|-------------|
 | `-i`, `--input-dir` | `images` | Directory of source images |
 | `-o`, `--output-dir` | `output` | Directory for output PNG files |
-| `--min-mp` | `5.0` | Minimum output megapixels (inclusive) |
-| `--max-mp` | `10.0` | Maximum output megapixels (inclusive) |
 | `-v`, `--verbose` | off | Enable debug-level logging |
 
 ## Behavior
 
-Megapixels are calculated as:
+Every image in the input directory is processed with **`smart_resize`**:
 
-```
-MP = (width × height) / 1,000,000
-```
+| Parameter | Value |
+|-----------|-------|
+| `factor` | `28` |
+| `min_pixels` | `640,000` |
+| `max_pixels` | `2,822,400` |
 
-For **every** image in the input directory:
+The algorithm ensures:
 
-| Input size | Action |
-|------------|--------|
-| **&lt; 5 MP** | Upscale to ~10 MP |
-| **5–10 MP** | Convert to PNG only (no resize) |
-| **&gt; 10 MP** | Downscale to ~10 MP |
+1. **Dimension alignment** — height and width are divisible by `28`.
+2. **Pixel budget** — total pixels stay within `[640,000, 2,822,400]`.
+3. **Aspect ratio** — preserved as closely as possible.
+
+| Input size | Typical action |
+|------------|----------------|
+| **&lt; 640k pixels** | Upscale until pixel count reaches the allowed range |
+| **640k–2.82M pixels** | Adjust only if factor alignment changes dimensions |
+| **&gt; 2.82M pixels** | Downscale until pixel count fits the allowed range |
 
 Details:
 
-- **Aspect ratio** is always preserved.
-- **Resampling** uses Pillow `LANCZOS` for upscale and downscale.
-- **Rounding** adjusts width/height by ±1 px when needed so the final pixel count never exceeds `--max-mp` or falls below `--min-mp`.
+- **Resampling** uses Pillow `LANCZOS` when dimensions change.
+- **Aspect ratio guard** — images with an aspect ratio &gt; 200:1 are rejected with an error.
 - **Color mode** is converted to RGB before saving.
 - **Output format** is always PNG (`optimize=True`).
 - **Output filename** is `{original_stem}.png` (extension replaced, not appended).
-- **Unreadable files** are skipped with a warning; the script continues processing the rest.
+- **Unreadable files** (or extreme aspect ratios) are skipped with a warning; the script continues processing the rest.
 
 ## Supported input formats
 
@@ -102,9 +102,9 @@ image-resizer/
 ```
 INFO: Input: /path/to/image-resizer/images
 INFO: Output: /path/to/image-resizer/output
-INFO: Resizing all images to output within 5.0–10.0 MP
-INFO: Upscaled cc.png: 716x1016 (0.73 MP) -> 2655x3766 (10.00 MP) -> output/cc.png
-INFO: Downscaled visa-platinum.png: 5168x3344 (17.28 MP) -> 3930x2544 (10.00 MP) -> output/visa-platinum.png
+INFO: Using smart_resize (factor=28, min_pixels=640000, max_pixels=2822400)
+INFO: Upscaled cc.png: 716x1016 (0.73 MP) -> 1904x2688 (5.12 MP) -> output/cc.png
+INFO: Downscaled visa-platinum.png: 5168x3344 (17.28 MP) -> 3920x2520 (9.88 MP) -> output/visa-platinum.png
 INFO: Done. Resized 8 image(s), skipped 0.
 ```
 
@@ -113,4 +113,4 @@ INFO: Done. Resized 8 image(s), skipped 0.
 | Code | Meaning |
 |------|---------|
 | `0` | Success |
-| `1` | Error (missing input dir, invalid MP bounds, etc.) |
+| `1` | Error (e.g. missing input directory) |

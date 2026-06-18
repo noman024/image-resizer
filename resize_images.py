@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Resize any image so output is within 5–10 MP for OCR; save as PNG."""
+"""Resize images with smart_resize for OCR; save as PNG."""
 
 from __future__ import annotations
 
 import argparse
 import logging
+import math
 import sys
 from pathlib import Path
 
@@ -24,51 +25,64 @@ SUPPORTED_EXTENSIONS = {
     ".pjp",
 }
 
-DEFAULT_MIN_MP = 5.0
-DEFAULT_MAX_MP = 10.0
+DEFAULT_FACTOR = 28
+DEFAULT_MIN_PIXELS = 640_000
+DEFAULT_MAX_PIXELS = 2_822_400
 MEGAPIXEL = 1_000_000
+
+
+def round_by_factor(value: float, factor: int) -> int:
+    return round(value / factor) * factor
+
+
+def floor_by_factor(value: float, factor: int) -> int:
+    return math.floor(value / factor) * factor
+
+
+def ceil_by_factor(value: float, factor: int) -> int:
+    return math.ceil(value / factor) * factor
+
+
+def smart_resize(
+    height: int,
+    width: int,
+    factor: int = 28,
+    min_pixels: int = 640_000,
+    max_pixels: int = 2_822_400,
+) -> tuple[int, int]:
+    """Rescales the image so that the following conditions are met:
+
+    1. Both dimensions (height and width) are divisible by 'factor'.
+
+    2. The total number of pixels is within the range ['min_pixels', 'max_pixels'].
+
+    3. The aspect ratio of the image is maintained as closely as possible.
+
+    """
+    if max(height, width) / min(height, width) > 200:
+        raise ValueError(
+            f"absolute aspect ratio must be smaller than 200, got "
+            f"{max(height, width) / min(height, width)}"
+        )
+    h_bar = max(factor, round_by_factor(height, factor))
+    w_bar = max(factor, round_by_factor(width, factor))
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = max(factor, floor_by_factor(height / beta, factor))
+        w_bar = max(factor, floor_by_factor(width / beta, factor))
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = ceil_by_factor(height * beta, factor)
+        w_bar = ceil_by_factor(width * beta, factor)
+        if h_bar * w_bar > max_pixels:
+            beta = math.sqrt((h_bar * w_bar) / max_pixels)
+            h_bar = max(factor, floor_by_factor(h_bar / beta, factor))
+            w_bar = max(factor, floor_by_factor(w_bar / beta, factor))
+    return h_bar, w_bar
 
 
 def megapixels(width: int, height: int) -> float:
     return (width * height) / MEGAPIXEL
-
-
-def compute_resized_dimensions(
-    width: int, height: int, target_mp: float, min_mp: float, max_mp: float
-) -> tuple[int, int]:
-    """Return dimensions at target_mp, clamped to [min_mp, max_mp] after rounding."""
-    scale = (target_mp * MEGAPIXEL / (width * height)) ** 0.5
-    new_width = max(1, round(width * scale))
-    new_height = max(1, round(height * scale))
-
-    while megapixels(new_width, new_height) > max_mp and (
-        new_width > 1 or new_height > 1
-    ):
-        if new_width >= new_height:
-            new_width -= 1
-        else:
-            new_height -= 1
-
-    while megapixels(new_width, new_height) < min_mp:
-        if new_width >= new_height:
-            new_width += 1
-        else:
-            new_height += 1
-
-    return new_width, new_height
-
-
-def target_megapixels(current_mp: float, min_mp: float, max_mp: float) -> float | None:
-    """
-    Pick resize target so output falls within [min_mp, max_mp].
-
-    Returns None when the image is already in range (convert-only).
-    """
-    if current_mp < min_mp:
-        return max_mp
-    if current_mp > max_mp:
-        return max_mp
-    return None
 
 
 def is_image_file(path: Path) -> bool:
@@ -78,11 +92,9 @@ def is_image_file(path: Path) -> bool:
 def process_image(
     input_path: Path,
     output_path: Path,
-    min_mp: float,
-    max_mp: float,
 ) -> tuple[int, int, int, int, float, float, str]:
     """
-    Resize (or convert) a single image so output is within [min_mp, max_mp].
+    Resize a single image with smart_resize.
 
     Returns (old_w, old_h, new_w, new_h, old_mp, new_mp, action).
     """
@@ -90,17 +102,17 @@ def process_image(
         image = image.convert("RGB")
         old_width, old_height = image.size
         old_mp = megapixels(old_width, old_height)
-        target_mp = target_megapixels(old_mp, min_mp, max_mp)
 
-        if target_mp is None:
-            new_width, new_height = old_width, old_height
+        new_height, new_width = smart_resize(old_height, old_width)
+
+        old_pixels = old_width * old_height
+        new_pixels = new_width * new_height
+
+        if new_width == old_width and new_height == old_height:
             action = "converted"
             output_image = image
         else:
-            new_width, new_height = compute_resized_dimensions(
-                old_width, old_height, target_mp, min_mp, max_mp
-            )
-            action = "upscaled" if target_mp > old_mp else "downscaled"
+            action = "upscaled" if new_pixels > old_pixels else "downscaled"
             output_image = image.resize(
                 (new_width, new_height), Image.Resampling.LANCZOS
             )
@@ -116,13 +128,8 @@ def process_image(
 def process_images(
     input_dir: Path,
     output_dir: Path,
-    min_mp: float,
-    max_mp: float,
 ) -> tuple[int, int]:
     """Process all images. Returns (processed_count, skipped_count)."""
-    if min_mp >= max_mp:
-        raise ValueError("min_mp must be less than max_mp")
-
     image_files = sorted(
         path for path in input_dir.iterdir() if is_image_file(path)
     )
@@ -134,7 +141,7 @@ def process_images(
         output_path = output_dir / f"{image_path.stem}.png"
         try:
             old_w, old_h, new_w, new_h, old_mp, new_mp, action = process_image(
-                image_path, output_path, min_mp, max_mp
+                image_path, output_path
             )
         except Exception as exc:
             logging.warning("Skipping unreadable file %s: %s", image_path.name, exc)
@@ -161,7 +168,7 @@ def process_images(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Resize any image so output is within 5–10 MP for OCR. "
+            "Resize images with smart_resize for OCR. "
             "Aspect ratio is preserved; output is saved as PNG."
         )
     )
@@ -178,18 +185,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=Path("output"),
         help="Directory for resized PNG files (default: output)",
-    )
-    parser.add_argument(
-        "--min-mp",
-        type=float,
-        default=DEFAULT_MIN_MP,
-        help=f"Minimum output megapixels (default: {DEFAULT_MIN_MP})",
-    )
-    parser.add_argument(
-        "--max-mp",
-        type=float,
-        default=DEFAULT_MAX_MP,
-        help=f"Maximum output megapixels (default: {DEFAULT_MAX_MP})",
     )
     parser.add_argument(
         "-v",
@@ -215,28 +210,19 @@ def main(argv: list[str] | None = None) -> int:
         logging.error("Input directory does not exist: %s", input_dir)
         return 1
 
-    if args.min_mp <= 0 or args.max_mp <= 0:
-        logging.error("min-mp and max-mp must be positive")
-        return 1
-
     logging.info("Input: %s", input_dir)
     logging.info("Output: %s", output_dir)
     logging.info(
-        "Resizing all images to output within %.1f–%.1f MP",
-        args.min_mp,
-        args.max_mp,
+        "Using smart_resize (factor=%d, min_pixels=%d, max_pixels=%d)",
+        DEFAULT_FACTOR,
+        DEFAULT_MIN_PIXELS,
+        DEFAULT_MAX_PIXELS,
     )
 
-    try:
-        processed, skipped = process_images(
-            input_dir=input_dir,
-            output_dir=output_dir,
-            min_mp=args.min_mp,
-            max_mp=args.max_mp,
-        )
-    except ValueError as exc:
-        logging.error("%s", exc)
-        return 1
+    processed, skipped = process_images(
+        input_dir=input_dir,
+        output_dir=output_dir,
+    )
 
     logging.info("Done. Resized %d image(s), skipped %d.", processed, skipped)
     return 0
